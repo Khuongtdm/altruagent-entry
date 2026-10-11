@@ -1,0 +1,18 @@
+{
+  "power_margin": 30,
+  "power_margin_2": 60,
+  "second_proc_cash": 2400,
+  "cash_reserve": 500,
+  "first_proc_min_cash": 1800,
+  "war_factory_min_cash": 1800,
+  "extra_power_min_cash": 900,
+  "harvesters_target": 2,
+  "harvester_min_cash": 1800,
+  "guard_count": 2,
+  "scout_count": 1,
+  "guard_min_cash": 900,
+  "scout_min_cash": 1000,
+  "scout_cooldown_s": 45,
+  "repair_min_cash": 1000,
+  "log_every_s": 5
+}
