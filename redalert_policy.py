@@ -29,7 +29,7 @@ from collections import Counter
 
 import requests
 
-POLICY_VERSION = "ra-3.0"
+POLICY_VERSION = "ra-3.1"
 
 LLM_URL = os.environ.get("LLM_BASE_URL", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "")
@@ -51,28 +51,33 @@ PARAM_SPECS = {
     "target_rax": (2, 1, 5, "barracks (tent or barr) to build"),
     "target_weap": (2, 1, 4, "war factories to build"),
     "target_fix": (1, 0, 2, "service depots (unlock heavy tanks)"),
-    "target_defenses": (3, 0, 10, "defensive structures (flame tower, pillbox, turret, tesla coil)"),
-    "minimum_economic_harvesters": (2, 1, 4, "harvesters to get before optional spending"),
-    "harvesters_target": (4, 1, 8, "harvesters to build in total"),
+    "target_defenses": (2, 0, 10, "defensive structures (flame tower, pillbox, turret, tesla coil)"),
+    "minimum_economic_harvesters": (3, 1, 5, "harvesters to get before extra infantry and tanks"),
+    "harvesters_target": (5, 1, 8, "harvesters to build in total"),
     "harvester_min_cash": (1000, 300, 3000, "funds needed before training a harvester"),
-    "combat_target": (30, 6, 80, "living combat units that trigger the main attack"),
+    "combat_target": (24, 6, 80, "living combat units (with the tank requirement) that trigger the main attack"),
+    "attack_tanks": (6, 0, 30, "tanks needed in the army before the main attack (0 = ignore)"),
+    "attack_by_s": (600, 200, 1500, "game second after which the attack launches anyway with 20+ units"),
+    "inf_cap": (16, 6, 60, "max infantry (rifle and rocket soldiers); beyond it money goes to tanks"),
+    "econ_gate_army": (8, 0, 40, "infantry beyond this many wait until harvesters >= the minimum (unless threatened)"),
+    "e3_when_armor": (1, 0, 1, "1 = train rocket soldiers instead of rifle when 2+ enemy tanks are seen"),
     "combat_batch": (3, 1, 10, "infantry per order once past the defense floor"),
     "combat_min_cash": (700, 100, 3000, "funds needed before extra infantry past the floor"),
     "surplus_cash": (2000, 500, 10000, "above this, always keep training army (never sit on money)"),
     "floor_t1": (100, 30, 400, "game second where floor_0 ends"),
     "floor_t2": (170, 60, 600, "game second where floor_1 ends"),
     "floor_t3": (230, 90, 900, "game second where floor_2 ends"),
-    "floor_0": (5, 0, 40, "minimum army before floor_t1"),
+    "floor_0": (6, 0, 40, "minimum army before floor_t1"),
     "floor_1": (10, 0, 40, "minimum army before floor_t2"),
-    "floor_2": (18, 0, 60, "minimum army before floor_t3"),
-    "floor_3": (26, 0, 80, "minimum army after floor_t3"),
+    "floor_2": (14, 0, 60, "minimum army before floor_t3"),
+    "floor_3": (15, 0, 80, "minimum army after floor_t3"),
     "use_tanks": (1, 0, 1, "1 = also train tanks from the war factory"),
-    "tank_min_cash": (1500, 500, 4000, "funds needed before training tanks"),
+    "tank_min_cash": (900, 300, 4000, "funds needed before training tanks"),
     "tank_count": (2, 1, 5, "tanks per order"),
     "rally_distance": (14, 0, 40, "cells in front of the base toward the enemy where troops gather (0 = off)"),
     "defend_radius": (28, 5, 80, "enemy within this many cells of base triggers a defensive response"),
     "reinforce_every_s": (15, 5, 120, "seconds between reinforcement waves during an attack"),
-    "reinforce_min": (8, 1, 40, "idle units at home needed to send a reinforcement wave"),
+    "reinforce_min": (12, 1, 40, "idle units at home needed to send a reinforcement wave"),
     "all_in_cooldown_s": (25, 5, 200, "seconds between main attack launches"),
     "tiebreak_window_s": (150, 0, 600, "last seconds: hold the army if ahead, push if behind (0 = off)"),
     "repair_min_cash": (900, 0, 3000, "funds needed before repairing a building"),
@@ -84,9 +89,11 @@ COMBAT_TYPES = {
     "e1", "e2", "e3", "e4", "dog", "shok", "1tnk", "2tnk", "3tnk", "4tnk", "ttnk", "ctnk", "stnk",
     "jeep", "arty", "v2rl", "yak", "mig", "heli", "hind",
 }
+TANK_TYPES = {"1tnk", "2tnk", "3tnk", "4tnk", "ttnk", "ctnk", "stnk", "arty", "v2rl"}
+ARMOR_TYPES = TANK_TYPES | {"apc"}
+INFANTRY_TYPES = {"e1", "e2", "e3", "e4", "shok"}
 DEFENSE_TYPES = ("ftur", "pbox", "gun", "tsla", "hbox", "agun", "sam")
 DEFENSE_PRIORITY = ("ftur", "pbox", "gun", "tsla")
-TANK_PRIORITY = ("3tnk", "2tnk", "1tnk", "jeep")
 PRODUCTION_BUILDINGS = ("barr", "tent", "weap")
 
 
@@ -229,7 +236,6 @@ class RedAlertPolicy:
         self._ctx = {}
         self._flags = set()
         self._prev_owned = Counter()
-        self._post_i = 0
 
     # ---- small helpers ----------------------------------------------------------------
 
@@ -306,7 +312,7 @@ class RedAlertPolicy:
             return 800
         return 700  # defenses
 
-    def _next_building(self, funds, eco, avail, owned, rax, harvesters, post_attack):
+    def _next_building(self, funds, eco, avail, owned, rax, harvesters, optional_ok):
         p = self.p
         drained, provided = _as_int(eco.get("power_drained")), _as_int(eco.get("power_provided"))
         defense = self._defense_item(avail)
@@ -319,26 +325,24 @@ class RedAlertPolicy:
             ("powr", drained + p["power_margin_2"] > provided),
         ]
         extra = [
+            ("fix", owned["weap"] >= 1 and owned["fix"] < p["target_fix"]),  # unlocks tanks, so it comes early
             ("proc", owned["proc"] < p["target_proc"] and (owned["proc"] == 1 or harvesters >= 2)),
-            ("powr", owned["powr"] < p["target_powr"]),
+            ("powr", owned["powr"] < p["target_powr"] and drained + 120 > provided),  # only when power is getting tight
+            ("weap", owned["fix"] >= 1 and owned["weap"] < p["target_weap"]),
             (defense, bool(defense) and self._defense_count(owned) < min(1, p["target_defenses"])),
-            ("weap", owned["weap"] < p["target_weap"]),
             (rax, owned[rax] < p["target_rax"]),
-            ("fix", owned["fix"] < p["target_fix"]),
             (defense, bool(defense) and self._defense_count(owned) < p["target_defenses"]),
         ]
-        for item, wanted in core + extra:
+        for item, wanted in core:
             if wanted and item and item in avail and funds >= self._min_funds(item, owned):
                 return item
-        if post_attack:  # keep investing surplus once the main attack is out
-            cycle = ["powr", "proc", "weap", rax, defense]
-            for offset in range(len(cycle)):
-                item = cycle[(self._post_i + offset) % len(cycle)]
-                if item and item in avail and funds >= self._min_funds(item, owned):
-                    if item == "proc" and harvesters < 2:
-                        continue
-                    self._post_i = (self._post_i + offset + 1) % len(cycle)
-                    return item
+        for item, wanted in extra:
+            if not wanted or not item or item not in avail:
+                continue
+            if not optional_ok and item != "fix":
+                continue  # no optional buildings while the army is below the floor or the base is threatened
+            if funds >= self._min_funds(item, owned):
+                return item
         return None
 
     def _assets_complete(self, avail, owned, rax):
@@ -432,8 +436,11 @@ class RedAlertPolicy:
         # 2. Army picture and the nearest threat to the base.
         army = [u for u in units if str(u.get("type", "")).lower() in COMBAT_TYPES and u.get("id") is not None]
         n_army = len(army)
+        n_inf = sum(1 for u in army if str(u.get("type", "")).lower() in INFANTRY_TYPES)
+        n_tanks = sum(1 for u in army if str(u.get("type", "")).lower() in TANK_TYPES)
         enemies = [e for e in (obs.get("visible_enemies") or []) if isinstance(e, dict) and not e.get("wreck")]
         nearest, near_d = None, None
+        armor_seen = sum(1 for e in enemies if str(e.get("type", "")).lower() in ARMOR_TYPES)
         if enemies:
             self._once(gs, "enemy_first_seen", types=_counts(enemies))
         if base:
@@ -482,15 +489,19 @@ class RedAlertPolicy:
         reserve = int(p["cash_reserve"])
         building_sent = False
         harvester_sent = False
+        floor = self._floor(gs)
+        need_defense = n_army < floor
+        econ_ok = harvesters >= min_h or not (owned["weap"] and owned["proc"] and "harv" in avail)
+        optional_ok = n_army >= floor and not threat and econ_ok
 
-        # 5. One building at a time.
+        # 5. One building at a time. Extra buildings wait until the army is at its floor.
         if owned["fact"] and not has_building_q:
-            item = self._next_building(funds, eco, avail, owned, rax, harvesters, self._attacking)
+            item = self._next_building(funds, eco, avail, owned, rax, harvesters, optional_ok)
             if item and self._fresh("build:" + item, 3, gs):
                 orders.append({"cmd": "build", "item": item})
                 building_sent = True
 
-        # 6. Harvesters: get out of the one-harvester trap before optional spending.
+        # 6. Harvesters: get out of the one-harvester trap before extra spending.
         want_h = max(min_h, int(p["harvesters_target"]))
         if (owned["weap"] and owned["proc"] and not has_veh_q and not pending_proc and "harv" in avail
                 and harvesters < want_h and funds >= p["harvester_min_cash"] + reserve
@@ -499,34 +510,40 @@ class RedAlertPolicy:
             orders.append({"cmd": "train", "item": "harv", "count": 1})
             harvester_sent = True
 
-        # 7. Army: defense floor first, then everything once assets are done or money piles up.
-        floor = self._floor(gs)
-        need_defense = n_army < floor
+        # 7. Infantry: a small defensive core (rocket soldiers if the enemy has tanks), never starving harvesters.
         assets_ok = self._assets_complete(avail, owned, rax)
         harvesters_ok = harvesters >= want_h
         surplus = funds >= p["surplus_cash"]
-        cap = int(p["combat_target"]) * (2 if self._attacking else 1)
-        unit = "e1" if "e1" in avail else ("e3" if "e3" in avail else None)
-        if (unit and owned[rax] and not has_inf_q and n_army < cap and not harvester_sent
+        unit = "e3" if (p["e3_when_armor"] and armor_seen >= 2 and "e3" in avail) else \
+            ("e1" if "e1" in avail else ("e3" if "e3" in avail else None))
+        econ_block = bool(owned["weap"] and owned["proc"] and "harv" in avail and harvesters < min_h
+                          and n_inf >= p["econ_gate_army"] and not threat)
+        inf_cap = int(p["inf_cap"])
+        if (unit and owned[rax] and not has_inf_q and n_inf < inf_cap and not harvester_sent and not econ_block
                 and (need_defense or surplus or (assets_ok and harvesters_ok and not building_sent))
                 and funds >= (150 if need_defense else p["combat_min_cash"] + reserve)
                 and self._fresh("train:army", 4, gs)):
             batch = 5 if need_defense else int(p["combat_batch"])
-            goal = floor if need_defense else cap
-            orders.append({"cmd": "train", "item": unit, "count": max(1, min(batch, goal - n_army))})
+            goal = min(inf_cap, floor) if need_defense else inf_cap
+            orders.append({"cmd": "train", "item": unit, "count": max(1, min(batch, goal - n_inf))})
 
-        tank = next((t for t in TANK_PRIORITY if t in avail), None)
+        # 8. Tanks: the main army. Continuous production once the depot is up and the economy is working.
+        tank = next((t for t in ("3tnk", "2tnk") if t in avail), None)
+        if tank is None and "1tnk" in avail and (owned["fix"] or gs > 300):
+            tank = "1tnk"
         if (p["use_tanks"] and tank and owned["weap"] and not has_veh_q and not harvester_sent
-                and funds >= p["tank_min_cash"] and (n_army >= min(floor, 8) or surplus)
-                and n_army < cap and self._fresh("train:tank", 5, gs)):
+                and (harvesters >= min_h or funds >= 2200)
+                and funds >= p["tank_min_cash"]
+                and (n_inf >= min(8, inf_cap) or surplus or threat)
+                and n_army < 3 * int(p["combat_target"]) and self._fresh("train:tank", 5, gs)):
             orders.append({"cmd": "train", "item": tank, "count": int(p["tank_count"])})
 
-        # 8. Rebuild an MCV if the construction yard died and a war factory survives.
+        # Rebuild an MCV if the construction yard died and a war factory survives.
         if (owned["fact"] == 0 and owned["weap"] and "mcv" in avail and not has_veh_q
                 and funds >= 2600 and self._fresh("train:mcv", 20, gs)):
             orders.append({"cmd": "train", "item": "mcv", "count": 1})
 
-        # 9. Main attack and reinforcements, with the time-limit tiebreak in mind.
+        # 9. Main attack (needs tanks, not only infantry) and grouped reinforcements; tiebreak-aware.
         attack_now = legal.get("attack_now")
         target = _cell(attack_now.get("to")) if isinstance(attack_now, dict) else None
         target = target or _cell(legal.get("enemy_base"))
@@ -535,18 +552,23 @@ class RedAlertPolicy:
         balance = _as_int(mil.get("kills_cost")) - _as_int(mil.get("deaths_cost"))
         hold = late and balance > 0
         need = int(p["combat_target"])
+        tank_possible = bool(p["use_tanks"]) and (n_tanks > 0 or bool(tank) or "fix" in avail or owned["fix"] > 0)
+        tank_req = int(p["attack_tanks"]) if tank_possible else 0
         if late and balance < 0:
-            need = max(6, need // 2)
+            need, tank_req = max(6, need // 2), 0
+        launch_ok = n_army >= need and n_tanks >= tank_req
+        if gs >= p["attack_by_s"] and n_army >= 20:
+            launch_ok = True
         if self._attacking and n_army < max(4, int(p["combat_target"]) // 4):
             self._attacking = False
             self.log.event(gs, "attack_wiped", army=n_army)
         ids = [u["id"] for u in army]
-        if target and not threat and not hold and not self._attacking and n_army >= need \
+        if target and not threat and not hold and not self._attacking and launch_ok \
                 and self._fresh("all_in", p["all_in_cooldown_s"], gs):
             for i in range(0, min(len(ids), 100), 50):
                 orders.append({"cmd": "attack_move", "units": ids[i:i + 50], "to": list(target)})
             self._attacking = True
-            self.log.event(gs, "attack_launched", army=n_army, to=list(target))
+            self.log.event(gs, "attack_launched", army=n_army, tanks=n_tanks, to=list(target))
         elif target and self._attacking and base and self._fresh("reinforce", p["reinforce_every_s"], gs):
             home = max(15, p["rally_distance"] * 2)
             fresh_units = [u["id"] for u in army if u.get("idle") and _cell(u) and _dist(base, _cell(u)) <= home]
@@ -559,21 +581,26 @@ class RedAlertPolicy:
             if repairable and self._fresh("repair", 10, gs):
                 orders.append({"cmd": "repair", "building": _id(repairable[0])})
 
-        self._ctx = {"funds": funds, "army": n_army, "floor": floor, "staging": staging,
-                     "enemy_dist": None if near_d is None else round(near_d, 1),
-                     "phase": "attack" if self._attacking else "build", "assets_ok": assets_ok}
+        self._ctx = {"funds": funds, "army": n_army, "inf": n_inf, "tanks": n_tanks, "floor": floor,
+                     "staging": staging, "enemy_dist": None if near_d is None else round(near_d, 1),
+                     "phase": "attack" if self._attacking else "build", "assets_ok": assets_ok,
+                     "harvesters": harvesters, "armor_seen": armor_seen}
         if orders:
             self._idle = ""
         elif has_building_q:
             self._idle = "building queue active"
-        elif has_inf_q and n_army < cap:
+        elif has_inf_q and n_inf < inf_cap:
             self._idle = "infantry queue active"
+        elif has_veh_q:
+            self._idle = "vehicle queue active"
         elif funds < reserve:
             self._idle = "funds below reserve (cash+ore=%d)" % funds
         elif harvesters < min_h:
             self._idle = "saving for a harvester"
-        elif n_army >= cap:
-            self._idle = "army at cap; waiting to launch or reinforce"
+        elif econ_block:
+            self._idle = "infantry paused until harvesters >= %d" % min_h
+        elif not optional_ok and not (assets_ok and harvesters_ok):
+            self._idle = "army below floor; optional buildings wait"
         elif not (assets_ok and harvesters_ok) and not surplus:
             self._idle = "assets or harvesters incomplete; waiting for funds or prerequisites"
         else:
